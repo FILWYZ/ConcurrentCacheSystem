@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace Cachae
+namespace KamaCache
 {
 
 // ============================================================================
@@ -20,14 +20,13 @@ namespace Cachae
 //    设计目标：O(1) 查找、O(1) 提权、O(1) 淘汰
 //    数据结构：std::list + std::unordered_map<Key, list::iterator>
 // ============================================================================
-
 template<
     typename Key,
     typename Value,
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>
 >
-class alignas(64) LruCacheShard
+class alignas(64) KLruCacheShard
 {
 public:
     struct CacheNode {
@@ -45,26 +44,20 @@ public:
     using ListIter = typename ListType::iterator;
     using MapType  = std::unordered_map<Key, ListIter, Hash, KeyEqual>;
 
-private:
-    const std::size_t capacity_;
-    ListType cacheList_;
-    MapType cacheMap_;
-    mutable std::mutex mutex_;
-
 public:
-    explicit LruCacheShard(std::size_t capacity)
+    explicit KLruCacheShard(std::size_t capacity)
         : capacity_(capacity)
     {
-        cacheMap_.reserve(capacity_);   
+        cacheMap_.reserve(capacity_);
     }
 
-    ~LruCacheShard() = default;
+    ~KLruCacheShard() = default;
 
-    LruCacheShard(const LruCacheShard&) = delete;
-    LruCacheShard& operator=(const LruCacheShard&) = delete;
+    KLruCacheShard(const KLruCacheShard&) = delete;
+    KLruCacheShard& operator=(const KLruCacheShard&) = delete;
 
-    LruCacheShard(LruCacheShard&&) = delete;
-    LruCacheShard& operator=(LruCacheShard&&) = delete;
+    KLruCacheShard(KLruCacheShard&&) = delete;
+    KLruCacheShard& operator=(KLruCacheShard&&) = delete;
 
     bool get(const Key& key, Value& value)
     {
@@ -93,12 +86,11 @@ public:
 
         // peek 只读 value，不改变 LRU 顺序
         value = it->second->value;
-
         return true;
     }
 
-    template<typename K, typename V>
-    bool updateifExists(K&& key, V&& value)
+    template<typename V>
+    bool updateIfExists(const Key& key, V&& value)
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -108,6 +100,8 @@ public:
         }
 
         it->second->value = std::forward<V>(value);
+        cacheList_.splice(cacheList_.begin(), cacheList_, it->second);
+
         return true;
     }
 
@@ -124,10 +118,10 @@ public:
         if (it != cacheMap_.end()) {
             it->second->value = std::forward<V>(value);
             cacheList_.splice(cacheList_.begin(), cacheList_, it->second);
-            return; 
+            return;
         }
 
-        if (cacheMap_.size() >= capacity_) {
+        if (cacheList_.size() >= capacity_) {
             auto& backNode = cacheList_.back();
             cacheMap_.erase(backNode.key);
             cacheList_.pop_back();
@@ -161,7 +155,6 @@ public:
     void clear()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-
         cacheList_.clear();
         cacheMap_.clear();
     }
@@ -169,66 +162,43 @@ public:
     std::size_t size() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return cacheMap_.size();
+        return cacheList_.size();
     }
 
     std::size_t capacity() const noexcept
     {
         return capacity_;
     }
+
+private:
+    const std::size_t capacity_;
+
+    ListType cacheList_;
+    MapType cacheMap_;
+
+    mutable std::mutex mutex_;
 };
 
 
 // ============================================================================
-// 2. 高并发分片 LRU 缓存 (原 LruHistoryCacheShard / HighConcurrencyCache 统一)
+// 2. 分片 LRU 缓存
 //    设计目标：将一把大锁拆成多把小锁，降低高并发访问下的锁竞争
+//    注意：这是分片加锁，不是 lock-free
 // ============================================================================
-
 template<
     typename Key,
     typename Value,
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>
 >
-class HighConcurrencyCache
+class KHighConcurrencyCache
 {
-private:
-    using ShardType = LruCacheShard<Key, Value, Hash, KeyEqual>;
-
-    const std::size_t shardNum_;
-    Hash hash_;
-    std::vector<std::unique_ptr<ShardType>> shards_;
-
-private:
-    static std::size_t normalizeShardNum(int shardNum)
-    {
-        if (shardNum > 0) {
-            return static_cast<std::size_t>(shardNum);
-        }
-
-        const unsigned int hardwareNum = std::thread::hardware_concurrency();
-        if (hardwareNum == 0) {
-            return 1;
-        }
-
-        return static_cast<std::size_t>(hardwareNum);
-    }
-
-    static std::size_t ceilDiv(std::size_t a, std::size_t b)
-    {
-        return (a + b - 1) / b;
-    }
-
-    std::size_t getShardIndex(const Key& key) const
-    {
-        return hash_(key) % shardNum_;
-    }
-
 public:
-    explicit HighConcurrencyCache(std::size_t totalCapacity, int shardNum = 0)
+    explicit KHighConcurrencyCache(std::size_t totalCapacity, int shardNum = 0)
         : shardNum_(normalizeShardNum(shardNum))
     {
         const std::size_t shardCapacity = ceilDiv(totalCapacity, shardNum_);
+
         shards_.reserve(shardNum_);
 
         for (std::size_t i = 0; i < shardNum_; ++i) {
@@ -238,15 +208,12 @@ public:
         }
     }
 
-    HighConcurrencyCache(const HighConcurrencyCache&) = delete;
-    HighConcurrencyCache& operator=(const HighConcurrencyCache&) = delete;
-    HighConcurrencyCache(HighConcurrencyCache&&) = default;
-    HighConcurrencyCache& operator=(HighConcurrencyCache&&) = default;
+    KHighConcurrencyCache(const KHighConcurrencyCache&) = delete;
+    KHighConcurrencyCache& operator=(const KHighConcurrencyCache&) = delete;
 
     template<typename K, typename V>
     void put(K&& key, V&& value)
     {
-        // 先通过 key 引用计算出 index，再完美转发，避免生命周期提前结束
         const std::size_t index = getShardIndex(key);
         shards_[index]->put(std::forward<K>(key), std::forward<V>(value));
     }
@@ -261,11 +228,13 @@ public:
         return shards_[getShardIndex(key)]->peek(key, value);
     }
 
-    template<typename K, typename V>
-    bool updateifExists(K&& key, V&& value)
+    template<typename V>
+    bool updateIfExists(const Key& key, V&& value)
     {
-        const std::size_t index = getShardIndex(key);
-        return shards_[index]->updateifExists(std::forward<K>(key), std::forward<V>(value));
+        return shards_[getShardIndex(key)]->updateIfExists(
+            key,
+            std::forward<V>(value)
+        );
     }
 
     bool remove(const Key& key)
@@ -283,9 +252,11 @@ public:
     std::size_t size() const
     {
         std::size_t total = 0;
+
         for (const auto& shard : shards_) {
             total += shard->size();
         }
+
         return total;
     }
 
@@ -293,6 +264,41 @@ public:
     {
         return shardNum_;
     }
+
+private:
+    using ShardType = KLruCacheShard<Key, Value, Hash, KeyEqual>;
+
+    static std::size_t normalizeShardNum(int shardNum)
+    {
+        if (shardNum > 0) {
+            return static_cast<std::size_t>(shardNum);
+        }
+
+        const unsigned int hardwareNum = std::thread::hardware_concurrency();
+
+        if (hardwareNum == 0) {
+            return 1;
+        }
+
+        return static_cast<std::size_t>(hardwareNum);
+    }
+
+    static std::size_t ceilDiv(std::size_t a, std::size_t b)
+    {
+        return (a + b - 1) / b;
+    }
+
+    std::size_t getShardIndex(const Key& key) const
+    {
+        return hash_(key) % shardNum_;
+    }
+
+private:
+    const std::size_t shardNum_;
+
+    Hash hash_;
+
+    std::vector<std::unique_ptr<ShardType>> shards_;
 };
 
 
@@ -300,11 +306,10 @@ public:
 // 3. LRU-K 历史区分片
 //    设计目标：把 count 和 value 放在同一个节点里，避免两个容器之间的数据不一致
 // ============================================================================
-
-enum class HistoryAccessResult
+enum class KHistoryAccessResult
 {
     Miss,
-    Hit,
+    HitHistory,
     Promoted
 };
 
@@ -314,7 +319,7 @@ template<
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>
 >
-class HistoryShard
+class KHistoryShard
 {
 public:
     struct HistoryNode {
@@ -334,51 +339,45 @@ public:
     using ListIter = typename ListType::iterator;
     using MapType  = std::unordered_map<Key, ListIter, Hash, KeyEqual>;
 
-private:
-    const std::size_t capacity_;
-    ListType historyList_;
-    MapType historyMap_;
-    mutable std::mutex mutex_;
-
 public:
-    explicit HistoryShard(std::size_t capacity)
+    explicit KHistoryShard(std::size_t capacity)
         : capacity_(capacity)
     {
         historyMap_.reserve(capacity_);
     }
 
-    HistoryShard(const HistoryShard&) = delete;
-    HistoryShard& operator=(const HistoryShard&) = delete;
+    KHistoryShard(const KHistoryShard&) = delete;
+    KHistoryShard& operator=(const KHistoryShard&) = delete;
 
-    HistoryShard(HistoryShard&&) = delete;
-    HistoryShard& operator=(HistoryShard&&) = delete;
+    KHistoryShard(KHistoryShard&&) = delete;
+    KHistoryShard& operator=(KHistoryShard&&) = delete;
 
-    HistoryAccessResult get(const Key& key, Value& value, std::size_t k)
+    KHistoryAccessResult get(const Key& key, Value& value, std::size_t k)
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = historyMap_.find(key);
         if (it == historyMap_.end()) {
-            return HistoryAccessResult::Miss;
+            return KHistoryAccessResult::Miss;
         }
 
         HistoryNode& node = *(it->second);
+
         ++node.count;
         value = node.value;
 
         if (node.count >= k) {
-            // 从历史区晋升到主区
             historyList_.erase(it->second);
             historyMap_.erase(it);
-            return HistoryAccessResult::Promoted;
+            return KHistoryAccessResult::Promoted;
         }
 
         historyList_.splice(historyList_.begin(), historyList_, it->second);
-        return HistoryAccessResult::Hit;
+        return KHistoryAccessResult::HitHistory;
     }
 
-    template<typename K, typename V>
-    std::optional<Value> put(K&& key, V&& value, std::size_t k)
+    template<typename V>
+    std::optional<Value> put(const Key& key, V&& value, std::size_t k)
     {
         if (capacity_ == 0) {
             return std::nullopt;
@@ -389,27 +388,30 @@ public:
         auto it = historyMap_.find(key);
         if (it != historyMap_.end()) {
             HistoryNode& node = *(it->second);
+
             node.value = std::forward<V>(value);
             ++node.count;
 
             if (node.count >= k) {
-                std::optional<Value> promotedValue = std::move(node.value);
+                std::optional<Value> promotedValue = node.value;
+
                 historyList_.erase(it->second);
                 historyMap_.erase(it);
+
                 return promotedValue;
             }
 
             historyList_.splice(historyList_.begin(), historyList_, it->second);
             return std::nullopt;
-        }   
+        }
 
-        if (historyMap_.size() >= capacity_) {
-            auto& last = historyList_.back();
-            historyMap_.erase(last.key);
+        if (historyList_.size() >= capacity_) {
+            auto& backNode = historyList_.back();
+            historyMap_.erase(backNode.key);
             historyList_.pop_back();
         }
 
-        historyList_.emplace_front(std::forward<K>(key), std::forward<V>(value), 1);
+        historyList_.emplace_front(key, std::forward<V>(value), 1);
 
         try {
             historyMap_.emplace(historyList_.front().key, historyList_.begin());
@@ -439,7 +441,6 @@ public:
     void clear()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-
         historyList_.clear();
         historyMap_.clear();
     }
@@ -447,60 +448,36 @@ public:
     std::size_t size() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return historyMap_.size();
+        return historyList_.size();
     }
+
+private:
+    const std::size_t capacity_;
+
+    ListType historyList_;
+    MapType historyMap_;
+
+    mutable std::mutex mutex_;
 };
 
 
 // ============================================================================
 // 4. 分片 LRU-K 历史缓存
 // ============================================================================
-
 template<
     typename Key,
     typename Value,
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>
 >
-class ShardedHistoryCache
+class KShardedHistoryCache
 {
-private:
-    using ShardType = HistoryShard<Key, Value, Hash, KeyEqual>;
-
-    const std::size_t shardNum_;
-    Hash hash_;
-    std::vector<std::unique_ptr<ShardType>> shards_;
-
-private:
-    static std::size_t normalizeShardNum(int shardNum)
-    {
-        if (shardNum > 0) {
-            return static_cast<std::size_t>(shardNum);
-        }
-
-        const unsigned int hardwareNum = std::thread::hardware_concurrency();
-        if (hardwareNum == 0) {
-            return 1;
-        }
-
-        return static_cast<std::size_t>(hardwareNum);
-    }
-
-    static std::size_t ceilDiv(std::size_t a, std::size_t b)
-    {
-        return (a + b - 1) / b;
-    }
-
-    std::size_t getShardIndex(const Key& key) const
-    {
-        return hash_(key) % shardNum_;
-    }
-
-public: // 关键修复：修正拼写错误 pubilc -> public
-    explicit ShardedHistoryCache(std::size_t totalCapacity, int shardNum = 0)
+public:
+    explicit KShardedHistoryCache(std::size_t totalCapacity, int shardNum = 0)
         : shardNum_(normalizeShardNum(shardNum))
     {
         const std::size_t shardCapacity = ceilDiv(totalCapacity, shardNum_);
+
         shards_.reserve(shardNum_);
 
         for (std::size_t i = 0; i < shardNum_; ++i) {
@@ -510,16 +487,19 @@ public: // 关键修复：修正拼写错误 pubilc -> public
         }
     }
 
-    HistoryAccessResult get(const Key& key, Value& value, std::size_t k)
+    KHistoryAccessResult get(const Key& key, Value& value, std::size_t k)
     {
         return shards_[getShardIndex(key)]->get(key, value, k);
     }
 
-    template<typename K, typename V> // 关键修复：修正拼写错误 tempelate -> template 以及转发支持
-    std::optional<Value> put(K&& key, V&& value, std::size_t k)
+    template<typename V>
+    std::optional<Value> put(const Key& key, V&& value, std::size_t k)
     {
-        const std::size_t index = getShardIndex(key);
-        return shards_[index]->put(std::forward<K>(key), std::forward<V>(value), k);
+        return shards_[getShardIndex(key)]->put(
+            key,
+            std::forward<V>(value),
+            k
+        );
     }
 
     bool remove(const Key& key)
@@ -537,11 +517,48 @@ public: // 关键修复：修正拼写错误 pubilc -> public
     std::size_t size() const
     {
         std::size_t total = 0;
+
         for (const auto& shard : shards_) {
             total += shard->size();
         }
+
         return total;
     }
+
+private:
+    using ShardType = KHistoryShard<Key, Value, Hash, KeyEqual>;
+
+    static std::size_t normalizeShardNum(int shardNum)
+    {
+        if (shardNum > 0) {
+            return static_cast<std::size_t>(shardNum);
+        }
+
+        const unsigned int hardwareNum = std::thread::hardware_concurrency();
+
+        if (hardwareNum == 0) {
+            return 1;
+        }
+
+        return static_cast<std::size_t>(hardwareNum);
+    }
+
+    static std::size_t ceilDiv(std::size_t a, std::size_t b)
+    {
+        return (a + b - 1) / b;
+    }
+
+    std::size_t getShardIndex(const Key& key) const
+    {
+        return hash_(key) % shardNum_;
+    }
+
+private:
+    const std::size_t shardNum_;
+
+    Hash hash_;
+
+    std::vector<std::unique_ptr<ShardType>> shards_;
 };
 
 
@@ -553,31 +570,16 @@ public: // 关键修复：修正拼写错误 pubilc -> public
 //    3. get / put 都参与访问计数
 //    4. count 和 value 在同一个历史节点中维护，避免跨容器不一致
 // ============================================================================
-
 template<
     typename Key,
     typename Value,
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>
 >
-class LruKCache
+class KLruKCache
 {
-private:
-    const std::size_t k_;
-    HighConcurrencyCache<Key, Value, Hash, KeyEqual> mainCache_;
-    ShardedHistoryCache<Key, Value, Hash, KeyEqual> historyCache_;
-
-private:
-    static std::size_t checkK(std::size_t k)
-    {
-        if (k == 0) {
-            throw std::invalid_argument("k must be greater than 0");
-        }
-        return k;
-    }
-
 public:
-    LruKCache(
+    KLruKCache(
         std::size_t capacity,
         std::size_t historyCapacity,
         std::size_t k,
@@ -594,8 +596,8 @@ public:
         }
     }
 
-    LruKCache(const LruKCache&) = delete;
-    LruKCache& operator=(const LruKCache&) = delete;
+    KLruKCache(const KLruKCache&) = delete;
+    KLruKCache& operator=(const KLruKCache&) = delete;
 
     bool get(const Key& key, Value& value)
     {
@@ -607,37 +609,36 @@ public:
             return false;
         }
 
-        const HistoryAccessResult result = historyCache_.get(key, value, k_);
-        if (result == HistoryAccessResult::Miss) {
+        const KHistoryAccessResult result = historyCache_.get(key, value, k_);
+
+        if (result == KHistoryAccessResult::Miss) {
             return false;
         }
 
-        if (result == HistoryAccessResult::Promoted) {
+        if (result == KHistoryAccessResult::Promoted) {
             mainCache_.put(key, value);
         }
 
         return true;
     }
 
-    template<typename K, typename V>
-    void put(K&& key, V&& value)
+    template<typename V>
+    void put(const Key& key, V&& value)
     {
-        // 关键修复：方法名大小写统一调整为 updateifExists，并修正生命周期引用
-        if (mainCache_.updateifExists(key, value)) {
+        if (mainCache_.updateIfExists(key, value)) {
             return;
         }
 
         if (k_ == 1) {
-            mainCache_.put(std::forward<K>(key), std::forward<V>(value));
+            mainCache_.put(key, std::forward<V>(value));
             return;
         }
 
-        // 先保留一份对 key 的引用计算，避免提前转发导致 key 失效
         std::optional<Value> promotedValue =
             historyCache_.put(key, std::forward<V>(value), k_);
 
         if (promotedValue.has_value()) {
-            mainCache_.put(std::forward<K>(key), std::move(*promotedValue));
+            mainCache_.put(key, std::move(*promotedValue));
         }
     }
 
@@ -645,6 +646,7 @@ public:
     {
         const bool removedFromMain = mainCache_.remove(key);
         const bool removedFromHistory = historyCache_.remove(key);
+
         return removedFromMain || removedFromHistory;
     }
 
@@ -668,6 +670,22 @@ public:
     {
         return k_;
     }
+
+private:
+    static std::size_t checkK(std::size_t k)
+    {
+        if (k == 0) {
+            throw std::invalid_argument("k must be greater than 0");
+        }
+
+        return k;
+    }
+
+private:
+    const std::size_t k_;
+
+    KHighConcurrencyCache<Key, Value, Hash, KeyEqual> mainCache_;
+    KShardedHistoryCache<Key, Value, Hash, KeyEqual> historyCache_;
 };
 
-} // namespace Cachae
+} // namespace KamaCache

@@ -5,8 +5,7 @@
 #include <optional>
 #include <utility>
 
-// 大厂标准规范：将所有缓存模块统一收拢到 `Cache` 核心命名空间中，确保派生类能正确识别虚函数基类
-namespace Cache {
+namespace KamaCache {
 
 // ============================================================================
 // 1. 写入结果
@@ -211,7 +210,7 @@ public:
 };
 
 // ============================================================================
-// 4. 兼容旧命名别名
+// 4. 兼容旧命名
 // ============================================================================
 template <typename Key, typename Value>
 using KICachePolicy = CachePolicy<Key, Value>;
@@ -219,4 +218,4 @@ using KICachePolicy = CachePolicy<Key, Value>;
 template <typename Key, typename Value>
 using ICachePolicy = CachePolicy<Key, Value>;
 
-} // namespace Cache
+} // namespace KamaCache

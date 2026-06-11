@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include "../CachePolicy.h"
+#include "CachePolicy.h"
 
 namespace KamaCache {
 

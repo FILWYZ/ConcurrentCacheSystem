@@ -16,14 +16,26 @@
 
 #include "CachePolicy.h"
 
-namespace Cache {
+namespace KamaCache {
 
 // ============================================================================
-// 1. 单分片 LFU 缓存（工业改良版）
+// 1. 单分片 LFU 缓存
 //    设计目标：
-//    1. O(1) 查找与频次提升
-//    2. 严格的“先淘汰、后插入”逻辑
-//    3. 引入 Lazy Ageing (懒惰衰减) 机制，规避 O(N) 全量搬运导致的临界区死锁
+//    1. O(1) 查找
+//    2. O(1) 频次提升
+//    3. O(1) 淘汰最低频率节点
+//    4. 同频率下按 LRU 淘汰
+//
+//    数据结构：
+//    1. frequencyBuckets_:
+//       frequency -> list<CacheNode>
+//
+//    2. nodeIndex_:
+//       key -> list<CacheNode>::iterator
+//
+//    说明：
+//    CacheNode 内部同时保存 key / value / frequency。
+//    这样可以避免 value、frequency、bucket key 分散在多个容器中造成状态不一致。
 // ============================================================================
 template <
     typename Key,
@@ -31,29 +43,6 @@ template <
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>>
 class alignas(64) LFUCache final : public CachePolicy<Key, Value> {
-public:
-    struct CacheNode {
-        Key key;
-        Value value;
-        std::size_t frequency;
-        std::size_t lastTouchEpoch; // 逻辑时间戳，用于 Lazy Ageing
-
-        template <typename K, typename V>
-        CacheNode(K&& k, V&& v, std::size_t f, std::size_t epoch)
-            : key(std::forward<K>(k))
-            , value(std::forward<V>(v))
-            , frequency(f)
-            , lastTouchEpoch(epoch)
-        {
-        }
-    };
-
-    using NodeList = std::list<CacheNode>;
-    using NodeIterator = typename NodeList::iterator;
-
-    using NodeIndex = std::unordered_map<Key, NodeIterator, Hash, KeyEqual>;
-    using FrequencyBuckets = std::unordered_map<std::size_t, NodeList>;
-
 public:
     explicit LFUCache(
         std::size_t capacity,
@@ -96,38 +85,31 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
-        ++globalEpoch_; // 推进全局逻辑时钟
 
         auto found = nodeIndex_.find(key);
         if (found != nodeIndex_.end()) {
             found->second->value = std::forward<V>(value);
-            // 访问时先执行按需衰减，再提升频次
-            applyLazyAgeingLocked(found->second);
             promote(found->second);
             return CacheWriteResult::updated;
         }
 
-        // 大厂规范修复：先判定容量。如果超限，先淘汰旧拓扑（Evict），再执行插入（Insert）
         const bool needsEviction = nodeIndex_.size() >= capacity_;
-        if (needsEviction) {
-            evictOneLocked();
-        }
 
-        // 插入新节点，初始频率为 1
         auto& bucket = frequencyBuckets_[1];
-        bucket.emplace_front(std::forward<K>(key), std::forward<V>(value), 1, globalEpoch_);
+        bucket.emplace_front(std::forward<K>(key), std::forward<V>(value), 1);
+
         auto insertedNode = bucket.begin();
 
         try {
             auto insertion = nodeIndex_.emplace(insertedNode->key, insertedNode);
             if (!insertion.second) {
-                // 如果并发冲突，退化为更新
                 insertion.first->second->value = insertedNode->value;
+
                 bucket.erase(insertedNode);
                 if (bucket.empty()) {
                     frequencyBuckets_.erase(1);
                 }
-                applyLazyAgeingLocked(insertion.first->second);
+
                 promote(insertion.first->second);
                 return CacheWriteResult::updated;
             }
@@ -137,6 +119,10 @@ public:
                 frequencyBuckets_.erase(1);
             }
             throw;
+        }
+
+        if (needsEviction) {
+            evictOneLocked();
         }
 
         minFrequency_ = 1;
@@ -155,8 +141,6 @@ public:
             return false;
         }
 
-        // 先做 Lazy 衰减再提权
-        applyLazyAgeingLocked(found->second);
         value = found->second->value;
         promote(found->second);
 
@@ -210,7 +194,6 @@ public:
         nodeIndex_.clear();
         frequencyBuckets_.clear();
         minFrequency_ = 0;
-        globalEpoch_ = 0;
     }
 
     void purge()
@@ -246,55 +229,34 @@ public:
     }
 
 private:
-    // O(1) 渐进式衰减：根据逻辑时间差，按需让历史不活跃的节点衰减频率
-    void applyLazyAgeingLocked(NodeIterator node)
-    {
-        if (globalEpoch_ <= node->lastTouchEpoch) {
-            return;
+    struct CacheNode {
+        Key key;
+        Value value;
+        std::size_t frequency;
+
+        template <typename K, typename V>
+        CacheNode(K&& k, V&& v, std::size_t f)
+            : key(std::forward<K>(k))
+            , value(std::forward<V>(v))
+            , frequency(f)
+        {
         }
+    };
 
-        const std::size_t epochDiff = globalEpoch_ - node->lastTouchEpoch;
-        // 衰减阈值定义：例如当全局逻辑时钟推进超过容量的 4 倍时，频次减半
-        const std::size_t ageingThreshold = capacity_ * 4;
+    using NodeList = std::list<CacheNode>;
+    using NodeIterator = typename NodeList::iterator;
 
-        if (epochDiff >= ageingThreshold && node->frequency > 1) {
-            const std::size_t oldFrequency = node->frequency;
-            // 频次衰减减半，最低保持为 1
-            const std::size_t newFrequency = std::max<std::size_t>(1, oldFrequency / 2);
+    using NodeIndex = std::unordered_map<Key, NodeIterator, Hash, KeyEqual>;
+    using FrequencyBuckets = std::unordered_map<std::size_t, NodeList>;
 
-            if (oldFrequency != newFrequency) {
-                auto oldBucketIt = frequencyBuckets_.find(oldFrequency);
-                auto& oldBucket = oldBucketIt->second;
-
-                auto newBucketIt = frequencyBuckets_.try_emplace(newFrequency).first;
-                auto& newBucket = newBucketIt->second;
-
-                newBucket.splice(newBucket.begin(), oldBucket, node);
-                node->frequency = newFrequency;
-
-                if (oldBucket.empty()) {
-                    frequencyBuckets_.erase(oldBucketIt);
-                    if (minFrequency_ == oldFrequency) {
-                        minFrequency_ = newFrequency;
-                    }
-                } else if (minFrequency_ == oldFrequency) {
-                    // 旧桶没空，但是新诞生了更小频率的桶
-                    minFrequency_ = std::min(minFrequency_, newFrequency);
-                }
-            }
-        }
-        node->lastTouchEpoch = globalEpoch_;
-    }
-
+private:
     void promote(NodeIterator node)
     {
-        const std::size_t oldFrequency = node->frequency;
-        if (oldFrequency >= maxFrequency_) {
-            // 如果频次达到上限，直接更新时钟，防止数值溢出，不进行无休止提权
-            node->lastTouchEpoch = globalEpoch_;
-            return;
+        if (node->frequency >= maxFrequency_) {
+            ageFrequenciesLocked();
         }
 
+        const std::size_t oldFrequency = node->frequency;
         const std::size_t newFrequency = oldFrequency + 1;
 
         auto oldBucketIt = frequencyBuckets_.find(oldFrequency);
@@ -303,13 +265,12 @@ private:
         auto newBucketIt = frequencyBuckets_.try_emplace(newFrequency).first;
         auto& newBucket = newBucketIt->second;
 
-        // 提升到新桶头部 (MRU)
         newBucket.splice(newBucket.begin(), oldBucket, node);
         node->frequency = newFrequency;
-        node->lastTouchEpoch = globalEpoch_;
 
         if (oldBucket.empty()) {
-            frequencyBuckets_.erase(oldBucketIt);
+            frequencyBuckets_.erase(oldFrequency);
+
             if (minFrequency_ == oldFrequency) {
                 minFrequency_ = newFrequency;
             }
@@ -319,12 +280,12 @@ private:
     void eraseNodeFromBucket(NodeIterator node)
     {
         const std::size_t frequency = node->frequency;
+
         auto bucketIt = frequencyBuckets_.find(frequency);
-        if (bucketIt != frequencyBuckets_.end()) {
-            bucketIt->second.erase(node);
-            if (bucketIt->second.empty()) {
-                frequencyBuckets_.erase(bucketIt);
-            }
+        bucketIt->second.erase(node);
+
+        if (bucketIt->second.empty()) {
+            frequencyBuckets_.erase(bucketIt);
         }
     }
 
@@ -336,13 +297,15 @@ private:
         }
 
         auto bucketIt = frequencyBuckets_.find(minFrequency_);
+
         if (bucketIt == frequencyBuckets_.end() || bucketIt->second.empty()) {
             recomputeMinFrequency();
             bucketIt = frequencyBuckets_.find(minFrequency_);
         }
 
         auto& bucket = bucketIt->second;
-        // 同频率下按 LRU 准则淘汰：尾部是最久未访问的节点
+
+        // 同频率下，链表头部是最近访问，尾部是最久未访问。
         auto victim = std::prev(bucket.end());
 
         nodeIndex_.erase(victim->key);
@@ -350,16 +313,73 @@ private:
 
         if (bucket.empty()) {
             frequencyBuckets_.erase(bucketIt);
-            recomputeMinFrequency();
         }
+
+        if (nodeIndex_.empty()) {
+            minFrequency_ = 0;
+        }
+    }
+
+    void ageFrequenciesLocked()
+    {
+        if (frequencyBuckets_.empty()) {
+            minFrequency_ = 0;
+            return;
+        }
+
+        std::vector<std::size_t> frequencies;
+        frequencies.reserve(frequencyBuckets_.size());
+
+        for (const auto& bucketPair : frequencyBuckets_) {
+            frequencies.push_back(bucketPair.first);
+        }
+
+        std::sort(frequencies.begin(), frequencies.end());
+
+        FrequencyBuckets agedBuckets;
+        agedBuckets.reserve(frequencyBuckets_.size());
+
+        // 先创建目标桶，降低迁移中途异常导致状态不一致的风险。
+        for (const std::size_t frequency : frequencies) {
+            const std::size_t agedFrequency =
+                std::max<std::size_t>(1, frequency / 2);
+
+            agedBuckets.try_emplace(agedFrequency);
+        }
+
+        for (const std::size_t frequency : frequencies) {
+            auto sourceIt = frequencyBuckets_.find(frequency);
+            if (sourceIt == frequencyBuckets_.end()) {
+                continue;
+            }
+
+            const std::size_t agedFrequency =
+                std::max<std::size_t>(1, frequency / 2);
+
+            auto& source = sourceIt->second;
+            auto& destination = agedBuckets.find(agedFrequency)->second;
+
+            // 从旧桶尾部搬到新桶头部，可以保持原有 MRU -> LRU 的相对顺序。
+            while (!source.empty()) {
+                auto node = std::prev(source.end());
+
+                node->frequency = agedFrequency;
+                destination.splice(destination.begin(), source, node);
+            }
+        }
+
+        frequencyBuckets_.swap(agedBuckets);
+        recomputeMinFrequency();
     }
 
     void recomputeMinFrequency()
     {
         minFrequency_ = std::numeric_limits<std::size_t>::max();
+
         for (const auto& bucket : frequencyBuckets_) {
             minFrequency_ = std::min(minFrequency_, bucket.first);
         }
+
         if (frequencyBuckets_.empty()) {
             minFrequency_ = 0;
         }
@@ -370,7 +390,6 @@ private:
     const std::size_t maxFrequency_;
 
     std::size_t minFrequency_{0};
-    std::size_t globalEpoch_{0}; // 全局逻辑时钟，取代原先全局老化的 O(N) 遍历
 
     NodeIndex nodeIndex_;
     FrequencyBuckets frequencyBuckets_;
@@ -380,7 +399,11 @@ private:
 
 // ============================================================================
 // 2. 分片 LFU 缓存
-//    设计目标：将全局单锁拆为分片小锁，支持高性能多吞吐
+//    设计目标：
+//    1. 将一把全局大锁拆成多把 shard 小锁
+//    2. 每个 shard 内部是精确 LFU
+//    3. 整体是分片近似 LFU，不是全局严格 LFU
+//    4. 保留命中、未命中、淘汰统计
 // ============================================================================
 template <
     typename Key,
@@ -478,9 +501,11 @@ public:
     [[nodiscard]] std::size_t size() const override
     {
         std::size_t total = 0;
+
         for (const auto& shard : shards_) {
             total += shard->size();
         }
+
         return total;
     }
 
@@ -514,7 +539,6 @@ private:
     using Shard = LFUCache<Key, Value, Hash, KeyEqual>;
 
 private:
-    // 大厂规范修复：限制 shardCount 绝不能大于总容量 capacity，避免划分出 0 容量的分片
     static std::size_t normalizeShardCount(
         std::size_t capacity,
         std::size_t requestedShardCount) noexcept
@@ -522,9 +546,11 @@ private:
         if (capacity == 0) {
             return 1;
         }
+
         if (requestedShardCount == 0) {
             requestedShardCount = 1;
         }
+
         return std::min(capacity, requestedShardCount);
     }
 
@@ -556,9 +582,9 @@ private:
 };
 
 template <typename Key, typename Value>
-using LfuCache = LFUCache<Key, Value>;
+using KLfuCache = LFUCache<Key, Value>;
 
 template <typename Key, typename Value>
-using HashLfuCache = ShardedLFUCache<Key, Value>;
+using KHashLfuCache = ShardedLFUCache<Key, Value>;
 
-} // namespace Cache
+} // namespace KamaCache
