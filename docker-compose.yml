@@ -1,0 +1,14 @@
+services:
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cache_benchmark_container
+    # 你可以在这里随意修改容器运行时的默认压测参数
+    # 格式: [头文件路径, 操作数, 缓存容量, 线程数, 分片数]
+    command: [".", "5000000", "16384", "8", "8"]
+    # 限制容器可以使用的 CPU 核心数，确保多线程压测的公平性
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'

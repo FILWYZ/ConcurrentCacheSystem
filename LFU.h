@@ -7,6 +7,7 @@
 #include <functional>
 #include <limits>
 #include <list>
+#include <map> // 引入 map 优化频次桶
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -18,13 +19,6 @@
 
 namespace Cache {
 
-// ============================================================================
-// 1. 单分片 LFU 缓存（工业改良版）
-//    设计目标：
-//    1. O(1) 查找与频次提升
-//    2. 严格的“先淘汰、后插入”逻辑
-//    3. 引入 Lazy Ageing (懒惰衰减) 机制，规避 O(N) 全量搬运导致的临界区死锁
-// ============================================================================
 template <
     typename Key,
     typename Value,
@@ -36,84 +30,53 @@ public:
         Key key;
         Value value;
         std::size_t frequency;
-        std::size_t lastTouchEpoch; // 逻辑时间戳，用于 Lazy Ageing
+        std::size_t lastTouchEpoch; 
 
         template <typename K, typename V>
         CacheNode(K&& k, V&& v, std::size_t f, std::size_t epoch)
-            : key(std::forward<K>(k))
-            , value(std::forward<V>(v))
-            , frequency(f)
-            , lastTouchEpoch(epoch)
-        {
-        }
+            : key(std::forward<K>(k)), value(std::forward<V>(v)), frequency(f), lastTouchEpoch(epoch) {}
     };
 
     using NodeList = std::list<CacheNode>;
     using NodeIterator = typename NodeList::iterator;
-
     using NodeIndex = std::unordered_map<Key, NodeIterator, Hash, KeyEqual>;
-    using FrequencyBuckets = std::unordered_map<std::size_t, NodeList>;
+    
+    // 关键优化：使用基于红黑树的 std::map，依靠天然有序性，begin() 永远是最小频次桶
+    using FrequencyBuckets = std::map<std::size_t, NodeList>;
 
 public:
-    explicit LFUCache(
-        std::size_t capacity,
-        std::size_t maxFrequency = defaultMaxFrequency())
-        : LFUCache(capacity, maxFrequency, Hash{}, KeyEqual{})
-    {
-    }
+    explicit LFUCache(std::size_t capacity, std::size_t maxFrequency = defaultMaxFrequency())
+        : LFUCache(capacity, maxFrequency, Hash{}, KeyEqual{}) {}
 
-    LFUCache(
-        std::size_t capacity,
-        std::size_t maxFrequency,
-        const Hash& hash,
-        const KeyEqual& equal)
+    LFUCache(std::size_t capacity, std::size_t maxFrequency, const Hash& hash, const KeyEqual& equal)
         : capacity_(capacity)
         , maxFrequency_(std::max<std::size_t>(2, maxFrequency))
-        , nodeIndex_(0, hash, equal)
-    {
+        , nodeIndex_(0, hash, equal) {
         nodeIndex_.reserve(capacity_);
-        frequencyBuckets_.reserve(capacity_);
     }
 
-    ~LFUCache() override = default;
-
-    LFUCache(const LFUCache&) = delete;
-    LFUCache& operator=(const LFUCache&) = delete;
-
-    LFUCache(LFUCache&&) = delete;
-    LFUCache& operator=(LFUCache&&) = delete;
-
-    void put(const Key& key, const Value& value) override
-    {
+    void put(const Key& key, const Value& value) override {
         static_cast<void>(putAndReport(key, value));
     }
 
     template <typename K, typename V>
-    CacheWriteResult putAndReport(K&& key, V&& value)
-    {
-        if (capacity_ == 0) {
-            return CacheWriteResult::ignored;
-        }
+    CacheWriteResult putAndReport(K&& key, V&& value) {
+        if (capacity_ == 0) return CacheWriteResult::ignored;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        ++globalEpoch_; // 推进全局逻辑时钟
+        ++globalEpoch_; 
 
         auto found = nodeIndex_.find(key);
         if (found != nodeIndex_.end()) {
             found->second->value = std::forward<V>(value);
-            // 访问时先执行按需衰减，再提升频次
             applyLazyAgeingLocked(found->second);
             promote(found->second);
             return CacheWriteResult::updated;
         }
 
-        // 大厂规范修复：先判定容量。如果超限，先淘汰旧拓扑（Evict），再执行插入（Insert）
         const bool needsEviction = nodeIndex_.size() >= capacity_;
-        if (needsEviction) {
-            evictOneLocked();
-        }
+        if (needsEviction) evictOneLocked();
 
-        // 插入新节点，初始频率为 1
         auto& bucket = frequencyBuckets_[1];
         bucket.emplace_front(std::forward<K>(key), std::forward<V>(value), 1, globalEpoch_);
         auto insertedNode = bucket.begin();
@@ -121,267 +84,155 @@ public:
         try {
             auto insertion = nodeIndex_.emplace(insertedNode->key, insertedNode);
             if (!insertion.second) {
-                // 如果并发冲突，退化为更新
-                insertion.first->second->value = insertedNode->value;
+                insertion.first->second->value = std::move(insertedNode->value);
                 bucket.erase(insertedNode);
-                if (bucket.empty()) {
-                    frequencyBuckets_.erase(1);
-                }
+                if (bucket.empty()) frequencyBuckets_.erase(1);
                 applyLazyAgeingLocked(insertion.first->second);
                 promote(insertion.first->second);
                 return CacheWriteResult::updated;
             }
         } catch (...) {
             bucket.erase(insertedNode);
-            if (bucket.empty()) {
-                frequencyBuckets_.erase(1);
-            }
+            if (bucket.empty()) frequencyBuckets_.erase(1);
             throw;
         }
 
-        minFrequency_ = 1;
-
-        return needsEviction
-            ? CacheWriteResult::insertedWithEviction
-            : CacheWriteResult::inserted;
+        return needsEviction ? CacheWriteResult::insertedWithEviction : CacheWriteResult::inserted;
     }
 
-    bool get(const Key& key, Value& value) override
-    {
+    bool get(const Key& key, Value& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
-
         auto found = nodeIndex_.find(key);
-        if (found == nodeIndex_.end()) {
-            return false;
-        }
+        if (found == nodeIndex_.end()) return false;
 
-        // 先做 Lazy 衰减再提权
         applyLazyAgeingLocked(found->second);
         value = found->second->value;
         promote(found->second);
-
         return true;
     }
 
     using CachePolicy<Key, Value>::get;
 
-    [[nodiscard]] bool peek(const Key& key, Value& value) const override
-    {
+    [[nodiscard]] bool peek(const Key& key, Value& value) const override {
         std::lock_guard<std::mutex> lock(mutex_);
-
         const auto found = nodeIndex_.find(key);
-        if (found == nodeIndex_.end()) {
-            return false;
-        }
-
+        if (found == nodeIndex_.end()) return false;
         value = found->second->value;
         return true;
     }
 
-    bool erase(const Key& key) override
-    {
+    bool erase(const Key& key) override {
         std::lock_guard<std::mutex> lock(mutex_);
-
         auto found = nodeIndex_.find(key);
-        if (found == nodeIndex_.end()) {
-            return false;
-        }
-
-        const std::size_t removedFrequency = found->second->frequency;
+        if (found == nodeIndex_.end()) return false;
 
         eraseNodeFromBucket(found->second);
         nodeIndex_.erase(found);
-
-        if (nodeIndex_.empty()) {
-            minFrequency_ = 0;
-        } else if (
-            removedFrequency == minFrequency_
-            && frequencyBuckets_.find(removedFrequency) == frequencyBuckets_.end()) {
-            recomputeMinFrequency();
-        }
-
         return true;
     }
 
-    void clear() override
-    {
+    void clear() override {
         std::lock_guard<std::mutex> lock(mutex_);
-
         nodeIndex_.clear();
         frequencyBuckets_.clear();
-        minFrequency_ = 0;
         globalEpoch_ = 0;
     }
 
-    void purge()
-    {
-        clear();
-    }
-
-    [[nodiscard]] bool contains(const Key& key) const override
-    {
+    [[nodiscard]] bool contains(const Key& key) const override {
         std::lock_guard<std::mutex> lock(mutex_);
         return nodeIndex_.find(key) != nodeIndex_.end();
     }
 
-    [[nodiscard]] std::size_t size() const override
-    {
+    [[nodiscard]] std::size_t size() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         return nodeIndex_.size();
     }
 
-    [[nodiscard]] std::size_t capacity() const noexcept override
-    {
-        return capacity_;
-    }
-
-    [[nodiscard]] std::size_t maxFrequency() const noexcept
-    {
-        return maxFrequency_;
-    }
-
-    static constexpr std::size_t defaultMaxFrequency() noexcept
-    {
-        return 1U << 20U;
-    }
+    [[nodiscard]] std::size_t capacity() const noexcept override { return capacity_; }
+    [[nodiscard]] std::size_t maxFrequency() const noexcept { return maxFrequency_; }
+    static constexpr std::size_t defaultMaxFrequency() noexcept { return 1U << 20U; }
 
 private:
-    // O(1) 渐进式衰减：根据逻辑时间差，按需让历史不活跃的节点衰减频率
-    void applyLazyAgeingLocked(NodeIterator node)
-    {
-        if (globalEpoch_ <= node->lastTouchEpoch) {
-            return;
-        }
+    void applyLazyAgeingLocked(NodeIterator node) {
+        if (globalEpoch_ <= node->lastTouchEpoch) return;
 
         const std::size_t epochDiff = globalEpoch_ - node->lastTouchEpoch;
-        // 衰减阈值定义：例如当全局逻辑时钟推进超过容量的 4 倍时，频次减半
         const std::size_t ageingThreshold = capacity_ * 4;
 
         if (epochDiff >= ageingThreshold && node->frequency > 1) {
             const std::size_t oldFrequency = node->frequency;
-            // 频次衰减减半，最低保持为 1
             const std::size_t newFrequency = std::max<std::size_t>(1, oldFrequency / 2);
 
             if (oldFrequency != newFrequency) {
                 auto oldBucketIt = frequencyBuckets_.find(oldFrequency);
                 auto& oldBucket = oldBucketIt->second;
 
-                auto newBucketIt = frequencyBuckets_.try_emplace(newFrequency).first;
+                auto newBucketIt = frequencyBuckets_.emplace(newFrequency, NodeList{}).first;
                 auto& newBucket = newBucketIt->second;
 
                 newBucket.splice(newBucket.begin(), oldBucket, node);
                 node->frequency = newFrequency;
 
-                if (oldBucket.empty()) {
-                    frequencyBuckets_.erase(oldBucketIt);
-                    if (minFrequency_ == oldFrequency) {
-                        minFrequency_ = newFrequency;
-                    }
-                } else if (minFrequency_ == oldFrequency) {
-                    // 旧桶没空，但是新诞生了更小频率的桶
-                    minFrequency_ = std::min(minFrequency_, newFrequency);
-                }
+                if (oldBucket.empty()) frequencyBuckets_.erase(oldBucketIt);
             }
         }
         node->lastTouchEpoch = globalEpoch_;
     }
 
-    void promote(NodeIterator node)
-    {
+    void promote(NodeIterator node) {
         const std::size_t oldFrequency = node->frequency;
         if (oldFrequency >= maxFrequency_) {
-            // 如果频次达到上限，直接更新时钟，防止数值溢出，不进行无休止提权
             node->lastTouchEpoch = globalEpoch_;
             return;
         }
 
         const std::size_t newFrequency = oldFrequency + 1;
-
         auto oldBucketIt = frequencyBuckets_.find(oldFrequency);
         auto& oldBucket = oldBucketIt->second;
 
-        auto newBucketIt = frequencyBuckets_.try_emplace(newFrequency).first;
+        auto newBucketIt = frequencyBuckets_.emplace(newFrequency, NodeList{}).first;
         auto& newBucket = newBucketIt->second;
 
-        // 提升到新桶头部 (MRU)
         newBucket.splice(newBucket.begin(), oldBucket, node);
         node->frequency = newFrequency;
         node->lastTouchEpoch = globalEpoch_;
 
-        if (oldBucket.empty()) {
-            frequencyBuckets_.erase(oldBucketIt);
-            if (minFrequency_ == oldFrequency) {
-                minFrequency_ = newFrequency;
-            }
-        }
+        if (oldBucket.empty()) frequencyBuckets_.erase(oldBucketIt);
     }
 
-    void eraseNodeFromBucket(NodeIterator node)
-    {
+    void eraseNodeFromBucket(NodeIterator node) {
         const std::size_t frequency = node->frequency;
         auto bucketIt = frequencyBuckets_.find(frequency);
         if (bucketIt != frequencyBuckets_.end()) {
             bucketIt->second.erase(node);
-            if (bucketIt->second.empty()) {
-                frequencyBuckets_.erase(bucketIt);
-            }
+            if (bucketIt->second.empty()) frequencyBuckets_.erase(bucketIt);
         }
     }
 
-    void evictOneLocked()
-    {
-        if (nodeIndex_.empty()) {
-            minFrequency_ = 0;
-            return;
-        }
+    void evictOneLocked() {
+        if (frequencyBuckets_.empty()) return;
 
-        auto bucketIt = frequencyBuckets_.find(minFrequency_);
-        if (bucketIt == frequencyBuckets_.end() || bucketIt->second.empty()) {
-            recomputeMinFrequency();
-            bucketIt = frequencyBuckets_.find(minFrequency_);
-        }
-
+        // 核心优化：std::map 的 begin() 永远是当前活着的最小频次桶，彻底告别 O(N) 重算
+        auto bucketIt = frequencyBuckets_.begin(); 
         auto& bucket = bucketIt->second;
-        // 同频率下按 LRU 准则淘汰：尾部是最久未访问的节点
         auto victim = std::prev(bucket.end());
 
         nodeIndex_.erase(victim->key);
         bucket.erase(victim);
 
-        if (bucket.empty()) {
-            frequencyBuckets_.erase(bucketIt);
-            recomputeMinFrequency();
-        }
-    }
-
-    void recomputeMinFrequency()
-    {
-        minFrequency_ = std::numeric_limits<std::size_t>::max();
-        for (const auto& bucket : frequencyBuckets_) {
-            minFrequency_ = std::min(minFrequency_, bucket.first);
-        }
-        if (frequencyBuckets_.empty()) {
-            minFrequency_ = 0;
-        }
+        if (bucket.empty()) frequencyBuckets_.erase(bucketIt);
     }
 
 private:
     const std::size_t capacity_;
     const std::size_t maxFrequency_;
-
-    std::size_t minFrequency_{0};
-    std::size_t globalEpoch_{0}; // 全局逻辑时钟，取代原先全局老化的 O(N) 遍历
+    std::size_t globalEpoch_{0}; 
 
     NodeIndex nodeIndex_;
     FrequencyBuckets frequencyBuckets_;
-
     mutable std::mutex mutex_;
 };
 
-// ============================================================================
-// 2. 分片 LFU 缓存
-//    设计目标：将全局单锁拆为分片小锁，支持高性能多吞吐
-// ============================================================================
 template <
     typename Key,
     typename Value,
@@ -392,110 +243,52 @@ public:
     explicit ShardedLFUCache(
         std::size_t capacity,
         std::size_t shardCount = std::thread::hardware_concurrency(),
-        std::size_t maxFrequency =
-            LFUCache<Key, Value, Hash, KeyEqual>::defaultMaxFrequency(),
+        std::size_t maxFrequency = LFUCache<Key, Value, Hash, KeyEqual>::defaultMaxFrequency(),
         const Hash& hash = Hash{},
         const KeyEqual& equal = KeyEqual{})
-        : capacity_(capacity)
-        , hash_(hash)
-        , shardCount_(normalizeShardCount(capacity, shardCount))
-    {
+        : capacity_(capacity), hash_(hash), shardCount_(normalizeShardCount(capacity, shardCount)) {
         shards_.reserve(shardCount_);
-
         const std::size_t baseCapacity = capacity_ / shardCount_;
         const std::size_t extraCapacity = capacity_ % shardCount_;
 
         for (std::size_t index = 0; index < shardCount_; ++index) {
-            const std::size_t shardCapacity =
-                baseCapacity + (index < extraCapacity ? 1U : 0U);
-
-            shards_.push_back(
-                std::make_unique<Shard>(
-                    shardCapacity,
-                    maxFrequency,
-                    hash,
-                    equal));
+            const std::size_t shardCapacity = baseCapacity + (index < extraCapacity ? 1U : 0U);
+            shards_.push_back(std::make_unique<Shard>(shardCapacity, maxFrequency, hash, equal));
         }
     }
 
-    ~ShardedLFUCache() override = default;
-
-    ShardedLFUCache(const ShardedLFUCache&) = delete;
-    ShardedLFUCache& operator=(const ShardedLFUCache&) = delete;
-
-    ShardedLFUCache(ShardedLFUCache&&) = delete;
-    ShardedLFUCache& operator=(ShardedLFUCache&&) = delete;
-
-    void put(const Key& key, const Value& value) override
-    {
-        const CacheWriteResult result = shardFor(key).putAndReport(key, value);
-
-        if (result == CacheWriteResult::insertedWithEviction) {
+    void put(const Key& key, const Value& value) override {
+        if (shardFor(key).putAndReport(key, value) == CacheWriteResult::insertedWithEviction) {
             evictions_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    bool get(const Key& key, Value& value) override
-    {
+    bool get(const Key& key, Value& value) override {
         if (shardFor(key).get(key, value)) {
             hits_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
-
         misses_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
     using CachePolicy<Key, Value>::get;
 
-    [[nodiscard]] bool peek(const Key& key, Value& value) const override
-    {
-        return shardFor(key).peek(key, value);
-    }
-
-    bool erase(const Key& key) override
-    {
-        return shardFor(key).erase(key);
-    }
-
-    void clear() override
-    {
-        for (auto& shard : shards_) {
-            shard->clear();
-        }
-    }
-
-    void purge()
-    {
-        clear();
-    }
-
-    [[nodiscard]] bool contains(const Key& key) const override
-    {
-        return shardFor(key).contains(key);
-    }
-
-    [[nodiscard]] std::size_t size() const override
-    {
+    [[nodiscard]] bool peek(const Key& key, Value& value) const override { return shardFor(key).peek(key, value); }
+    bool erase(const Key& key) override { return shardFor(key).erase(key); }
+    void clear() override { for (auto& shard : shards_) shard->clear(); }
+    [[nodiscard]] bool contains(const Key& key) const override { return shardFor(key).contains(key); }
+    
+    [[nodiscard]] std::size_t size() const override {
         std::size_t total = 0;
-        for (const auto& shard : shards_) {
-            total += shard->size();
-        }
+        for (const auto& shard : shards_) total += shard->size();
         return total;
     }
 
-    [[nodiscard]] std::size_t capacity() const noexcept override
-    {
-        return capacity_;
-    }
+    [[nodiscard]] std::size_t capacity() const noexcept override { return capacity_; }
+    [[nodiscard]] std::size_t shardCount() const noexcept { return shardCount_; }
 
-    [[nodiscard]] std::size_t shardCount() const noexcept
-    {
-        return shardCount_;
-    }
-
-    [[nodiscard]] CacheStats stats() const noexcept override
-    {
+    [[nodiscard]] CacheStats stats() const noexcept override {
         return CacheStats{
             hits_.load(std::memory_order_relaxed),
             misses_.load(std::memory_order_relaxed),
@@ -503,8 +296,7 @@ public:
         };
     }
 
-    void resetStats() noexcept override
-    {
+    void resetStats() noexcept override {
         hits_.store(0, std::memory_order_relaxed);
         misses_.store(0, std::memory_order_relaxed);
         evictions_.store(0, std::memory_order_relaxed);
@@ -513,52 +305,25 @@ public:
 private:
     using Shard = LFUCache<Key, Value, Hash, KeyEqual>;
 
-private:
-    // 大厂规范修复：限制 shardCount 绝不能大于总容量 capacity，避免划分出 0 容量的分片
-    static std::size_t normalizeShardCount(
-        std::size_t capacity,
-        std::size_t requestedShardCount) noexcept
-    {
-        if (capacity == 0) {
-            return 1;
-        }
-        if (requestedShardCount == 0) {
-            requestedShardCount = 1;
-        }
+    static std::size_t normalizeShardCount(std::size_t capacity, std::size_t requestedShardCount) noexcept {
+        if (capacity == 0) return 1;
+        if (requestedShardCount == 0) requestedShardCount = 1;
         return std::min(capacity, requestedShardCount);
     }
 
-    [[nodiscard]] std::size_t shardIndex(const Key& key) const
-    {
-        return hash_(key) % shardCount_;
-    }
-
-    Shard& shardFor(const Key& key)
-    {
-        return *shards_[shardIndex(key)];
-    }
-
-    const Shard& shardFor(const Key& key) const
-    {
-        return *shards_[shardIndex(key)];
-    }
+    [[nodiscard]] std::size_t shardIndex(const Key& key) const { return hash_(key) % shardCount_; }
+    Shard& shardFor(const Key& key) { return *shards_[shardIndex(key)]; }
+    const Shard& shardFor(const Key& key) const { return *shards_[shardIndex(key)]; }
 
 private:
     const std::size_t capacity_;
     const Hash hash_;
     const std::size_t shardCount_;
-
     std::vector<std::unique_ptr<Shard>> shards_;
 
     std::atomic<std::uint64_t> hits_{0};
     std::atomic<std::uint64_t> misses_{0};
     std::atomic<std::uint64_t> evictions_{0};
 };
-
-template <typename Key, typename Value>
-using LfuCache = LFUCache<Key, Value>;
-
-template <typename Key, typename Value>
-using HashLfuCache = ShardedLFUCache<Key, Value>;
 
 } // namespace Cache

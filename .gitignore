@@ -1,7 +1,15 @@
-# Build directories
+# macOS
+.DS_Store
+
+# C/C++ build files
 build/
 cmake-build-*/
-out/
+*.o
+*.out
+*.a
+*.so
+*.dylib
+*.exe
 
 # CMake
 CMakeFiles/
@@ -9,21 +17,18 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 
-# Compiled files
-*.o
-*.obj
-*.a
-*.so
-*.dylib
-*.dll
-*.exe
-
-# macOS
-.DS_Store
+# Logs
+*.log
+logs/
 
 # IDE
 .vscode/
 .idea/
 
-# Logs
-*.log
+# Docker runtime data
+data/
+tmp/
+*.pid
+
+# Environment files
+.env
